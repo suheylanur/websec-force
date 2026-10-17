@@ -448,12 +448,141 @@ def check_hsts_value(response:Response)-> list[Finding]:
             )
         )    
         return findings
-    468
     
-            
-            
-            
+    #HSTS de max-age tarayicinin bu politikayi kac saniye uygulayacagini belirtir.
+
+    if max_age == 0:
+        findings.append(
+            Finding(
+                title="HSTS is disabled (max-age=0)",
+                severity="medium",
+                description="max-age=0 instructs browser to remove the HSTS policy.",
+                evidence=evidence,
+                recommendation="Use a meaningful max-age value when the site is HTTPS-only.",
+            )
+        )
+    elif max_age < HSTS_MIN_REECOMMENDED:
+        findings.append(
+            Finding(
+                title="Short HSTS max-age",
+                severity="low",
+                description=(
+                    f"HSTS max-age is {max_age} seconds,which is shorter than"
+                    "the commonly recommended duration (-6 months or more)."
+                ),
+                evidence=evidence,
+                recommendation="Consider increasing max-age to at least 31536000 ( 1 year).",
+                
+            )
+        )
+    if "includesubdomains" not in directives and max_age >0:
         
+    #directifde includesubdomains varsa alt alan adlarina da HSTS politikasi uygulanir
+        findings.append(
+            Finding(
+                title="HSTS does not cover subdomains.",
+                severity="info",
+                description="The HSTS policy lacks the includeSubDomains directive.",
+                evidence=evidence,
+                recommendation=(
+                    "Review whether includeSubDomains is appropriate"
+                    "(only if all subdomains support HTTPS)." 
+                ),
+            )
+        )   
+        #tarayici bir siteye ilk kez girerken henuz HSTS politikasini ogrenmemis olabilir.
+        #burada preload listesi devreye girer            
+        #bu listeye dahil olan siteler icin tarayici HTTPS kullanimi zorunlu tutabilir.
+                 
+    if "preload" in directives and (
+        max_age < HSTS_PRELOAD_MIN or "includesubdomains" not in directives
+    ):
+        findings.append(
+            Finding(
+                title="HSTS preload requirements not met",
+                severity="low",
+                description=(
+                    "The preload directive is set, but the policy does not meet."
+                    "preload list requirements."
+                ),
+                evidence=evidence,
+                recommendation=(
+                     "Preload requires max-age >= 31536000 and includeSubDomains."
+            ),
+        )  
+    )  
+    return findings
+def _parse_csp(csp: str) -> dict[str,list[str]]:
+    #csp yi sozluge cevirir.
+    #content security policy tarayiciya hangi kaynaklarin yuklenebilecegini bildirir.
+    directives: dict[str, list[str]] = {}
+    for part in csp.split(";"):
+        tokens = part.strip().split()
+        if not tokens:
+            continue
+        name = tokens[0].lower()
+        directives.setdefault(name,[t.lower() for t in  tokens[1:]])
+    return directives 
+
+def check_csp_value(response:Response)-> list[Finding]:
+    findings: list[Finding] = []
+    value = _get(response, "Content-Security-Policy")
+    if not value:
+        return findings
+    
+    directives = _parse_csp(value)
+    evidence=_truncate(f"Content-Security-Policy: {value} ")
+    #eger script-src yoksa tarayiuci default-src doner(fallback)
+    source_name ="script-src" if "script-src" in directives else "default-src" 
+    script_sources = directives.get(source_name)
+    
+    if script_sources is None:
+        findings.append(
+            Finding(
+                title = "CSP does not restrict scripts",
+                severity="low",
+                description="The CSP defines neither scrpit-src nor default-src.",
+                evidence=evidence,
+                recommendation="Define script-src (or default-src) to restrict script soureces."
+            )
+        )
+    else:
+        #eger nonce/hash varsa modern tarayicilar unsafe-inline i yok sayar
+        has_nonce_or_hash = any(
+        s.startswith(("'nonce-","'sha256-","'sha384-","'sha512-"))     
+        for s in script_sources )      
+               
+        if "'unsafe-inline'" in script_sources and not has_nonce_or_hash:
+            findings.append(
+                Finding(
+                    title="CSP allows unsafe-inline script ",
+                    severity="medium",
+                    description=(
+                        f"{source_name} contains 'unsafe-inline', which weakens "
+                         "protection against script injection."
+                    ),
+                    evidence=evidence,
+                    recommendation="Prefer nonces or hashes instead of unasfe-inline .",
+                    
+                )
+            )
+            
+        if "'unsafe-eval'" in script_sources:
+            findings.append(
+                Finding(
+                    title="CSP allows unsafe-eval.",
+                    severity="low",
+                    description=f"{source_name} contains unsafe-eval (eval-like execution) .",
+                    evidence=evidence,
+                    recommendation="Avoid unsafe-eval and refactor code that depends on eval().",
+                    
+                )
+            )       
+            
+            
+            606 
+
+    
         
 
 
