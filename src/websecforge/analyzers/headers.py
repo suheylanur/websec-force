@@ -15,7 +15,7 @@ from typing import Optional
 from urllib.parse import urlparse
 import requests
 from requests import Response
-from src.websecforge.models.finding import Finding
+from websecforge.models.finding import Finding
 
 SECURTY_ORDER = {"info":0,"low":1,"medium":2,"high":3}
 MAX_EVIDENCE_LENGTH = 300
@@ -578,11 +578,201 @@ def check_csp_value(response:Response)-> list[Finding]:
                     
                 )
             )       
+        #her siteden script yuklenmesine izin verilir.
+        
+        broad = [s for s in script_sources if s in ("*","http:","https","data")]   
+        if broad:
+            findings.append(
+                Finding(
+                    title = "CPS script source is overly broad.",
+                    severity= "medium",
+                    description= (
+                    f"{source_name} allows broad sources ({', '.join(broad)}),"
+                    "which may defeat the purpose of the policy."
+                ),
+                evidence = evidence,
+                recommendation = "Restrict script soruces to spesifci trusted origings.",
+            ) 
+        )
+           #default-src	Belirli kaynak direktifleri için varsayılan kuralı belirler.
+           # base-uri	HTML belgesindeki <base> elementinin hangi URL'leri kullanabileceğini sınırlar.
+           #object-src	<object> ve <embed> gibi elementlerle yüklenen içeriklerin kaynaklarını sınırlar.
+
+
+
+    missing = []
+    if "base-uri" not in directives:
+        missing.append("base-uri")
+    if "object-src" not in directives and "default-src" not in directives:
+        missing.append("object-src")
+    if missing:
+        findings.append(
+            Finding(
+                title = "CSP lacks hardening directives.",
+                severity="info",
+                descrpition =f"The CSP does not define: {', '.join(missing)}",
+                recommendation="Conside adding base-uri 'self' and object-src 'none'"
+            )
+        )       
+        return findings
+def check_simple_header_values(response : Response)-> list[Finding]:
+    #X-Frame-Options, X-Content-Type-Options ve Referrer-Policy değerleri.
+    findings: list[Finding] = []
+    # DENY ve SOMEOEIGIN degerlerini kontrol eder
+    xfo =_get(response , "X-Frame-Options")
+    if xfo and xfo.upper() not in ("DENY","SAMEORIGIN"):
+        findings.append(
+            Finding(
+                title="Unrecognized X-Frame-Options value",
+                severity ="low",
+                description=(
+                    "X-Frame-Options only supports DENY and SAMEORIGIN."
+                    "Other values (including ALLOW-FROM) are ignoredby modern browsers."
+                ),
+                evidence=_truncate(f"X-Frame-Options: {xfo}"),
+                recommendation="Use DENY/SAMEORIGIN or the CSP frame-ancestors directive.",
+                
+            )
+        ) 
+        #X-Content-Type-Options: tek geçerli değer nosniff
+        #tarayıcının sunucunun belirttiği içerik türünü kendi tahminiyle 
+        # değiştirmesini engelleyen bir HTTP güvenlik başlığıdır
+    xcto = _get(response, "X-Content-Type-Options")
+    if xcto and xcto.lower() != "nosniff":
+        findings.append(
+            Finding(
+                title="Unrecognized X-Content-Type-Options value",
+                                severity="low",
+                                description="The only valid value for this header is nosniff.",
+                                evidence=_truncate(f"X-Content-Type-Options: {xcto}"),
+                                recommendation="Set X-Content-Type-Options to nosniff.",
+                 
+            )
+        )
+        #Referrer-Policy
+        #URL bilgilerini gereğinden fazla paylaşabilecek politikaları tespit ediyor
+    referrer = _get(response, "Referrer-Policy")
+    if referrer:
+        effective = referrer.split(",")[-1].strip().lower() 
+        if effective in ("unsafe-url","no-referrer-when-downgrade"):
+            findings.append(
+                Finding(
+                    title ="Permissive Referrer-Policy",
+                    severity="low",
+                description=(
+                f"Refferer-Policy '{effective}'may leak full URLs."
+                "(including paths and query strings) to other origins."
+                ),
+                evidence=_truncate(f"Referrer-Policy: {referrer}"),
+                recommendation="Consider strict-origin-when-cross-origin or a stricter policy."
+            )   
+        )
+    return findings
+#CORS Cross origin resource sources : farklı origin'lerde
+# bulunan web uygulamalarının birbirlerinin kaynaklarına tarayıcı 
+# üzerinden erişmesine izin verilmesini düzenleyen bir mekanizmadır.
+def check_cors_configuration(response: Response)-> list[Finding]:
             
-            
-            606 
+        """ 
+        Pasif CORS kontrolu:sadece  mevcut responsa bakar,yeni istek gondermez.
+        '*' tek başına bulgu değildir (public API'lerde normaldir). Ancak '*' ile
+            credentials=true birleşimi tutarsızdır; tarayıcılar bunu reddeder.
+        """
+        findings: list[Finding] = []
+        allow_origin = _get(response, "Access-Control-Allow-Origin")
+        allow_credentials =_get(response,"Access-Control-Allow-Credentials")
+        
+        if allow_origin == "*" and (allow_credentials or "").lower() == "true":
+            findings.append(
+                Finding(
+                    title="Inconsistent CORS configuration",
+                    severity ="info",
+                    description=(
+                        "The response combines a wildcard (*) allowed origin with"
+                        "credentialed CORS.Browsers do not accept this combination."
+                    ),
+                    evidence=(
+                        "Access-Control-Allow-Origin: *; "
+                        "Access-Control-Allow-Credentials: true"
+                    ),
+                    recommendation=(
+                        "If credentialed cross-origin access is required, return an "
+                        "explicitly validated origin instead of a wildcard."
+                    ),
+                )
+            )
+        return findings
+def check_cors_reflection(
+    url:str,
+    timeout: float=10,
+    verify: bool = True,
+) -> list[Finding]:
+       #AKTİF CORS kontrolü: sahte Origin başlığıyla ek istekler gönderir. 
+       # Gerçek CORS zafiyetleri genelde sunucunun gelen Origin'i körü körüne
+       # yansıtmasıdır. Bu, normal (Origin'siz) istekte görünmez. Bu yüzden sadece
+       # yetkili olduğun hedeflerde ve probe_cors=True ile çalıştır.     
+    findings:list [Finding] = []
+    test_origins = ["https://example.ex",None ]
+    for origin in test_origins:
+        try:
+            probe= requests.get(
+                url,
+                headers={"Origin": origin},
+                timeout=timeout,
+                verify=verify,
+                allow_redirects=True,
+            )
+        except requests.RequestException:
+            continue #test basarisiz diger origini dene 
+        
+        allow_origin =_get(probe , "Access-Control-Allow-Origin")
+        allow_credentials =(_get(probe, "Access-Control-Allow-Credenetials")or "").lower()
+        
+        if allow_credentials != origin:
+            continue 
+        with_creds = allow_credentials == "true"
+        
+        findings.append(
+            Finding(
+                title=f"CORS reflects arbitrary Origin ({origin})",
+                #eger credentials ile birlestirilse baska bir site kullancii oturumuyla veri okuyabilir
+                severity="high" if with_creds else "medium",
+                description=(
+                    "The server echoed the supplied Origin in"
+                    "Access-Control-Allow-Origin"
+                    + (" and allows credentials." if with_creds else ".")
+                ),
+                evidence=_truncate(
+                    f"Origin: {origin} -> Access-Control-Allow-Origin: {allow_origin}; "
+                    f"Access-Control-Allow-Credentials: {allow_credentials or '(absent)'}"
+                    
+                ),
+                recommendation=(
+                    "Validate Origin against a strict allow-list and never "
+                    "reflect untrusted values, especially with credentials."
+                    
+                ),
+            )
+        ) 
+    return findings
+#COOKIE GUVENLIGI
+def get_set_cookie_headers(response: Response)-> list[str]:
+    raw_headers = getattr(getattr(response, "raw", None), "headers", None)
+    if raw_headers is not None and hasattr(raw_headers, "getlist"):
+            values = raw_headers.getlist("Set-Cookie")
+            if values:
+                return values
+        
+    """
+        Her Set-Cookie başlığını ayrı string olarak döndürür.
+    
+        `response.headers.get("Set-Cookie")` birden fazla cookie'yi virgülle
+        BİRLEŞTİRİR ve bu, Expires tarihindeki virgülle karışır. Bu yüzden
+        urllib3'ün ham başlık nesnesindeki getlist() tercih edilir.
+        """
+    # Yedek: ham başlıklar yoksa (ör. mock yanıt). Birden fazla cookie varsa
+    # ayrıştırma güvenilir olmayabilir.  
+    value = response.headers.get("Set-Cookie")
+    return [value] if value else []
 
     
-        
-
-
