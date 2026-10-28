@@ -17,7 +17,7 @@ import requests
 from requests import Response
 from websecforge.models.finding import Finding
 
-SECURTY_ORDER = {"info":0,"low":1,"medium":2,"high":3}
+SEVERITY_ORDER = {"info":0,"low":1,"medium":2,"high":3}
 MAX_EVIDENCE_LENGTH = 300
 HSTS_MIN_REECOMMENDED = 15_552_000
 HSTS_PRELOAD_MIN = 31_536_000
@@ -774,5 +774,159 @@ def get_set_cookie_headers(response: Response)-> list[str]:
     # ayrıştırma güvenilir olmayabilir.  
     value = response.headers.get("Set-Cookie")
     return [value] if value else []
+
+
+""" Cookie ozniteliklerini kontrol ediyoruz
+  
+    - Yönlendirme zincirindeki ara yanıtların cookie'leri de kontrol edilir
+      (response.history), çünkü requests sadece son yanıtı döndürür.
+    - Her cookie için TEK bulgu üretilir (en yüksek severity ile) ki rapor
+      şişmesin.
+    - Cookie DEĞERİ kanıtta gösterilmez (oturum anahtarı olabilir).
+    """ 
+    
+def check_cookie_security(response: Response) -> list[Finding]:
+    findings: list[Finding] = []
+    responses = list(response.history) + [response]
+    #sunucu yonlendirme sirasinda da cookie gonderebilir.kacirmamak icin ikisinide ekliyoruz.
+    for resp in responses:
+        is_https = _schema(resp.url) == "https"
+        
+        for cookie_header in get_set_cookie_headers(resp):
+            parts = [p.strip() for p in cookie_header.split(";")]
+            
+            cookie_name = parts[0].split("=",1)[0].strip()
+            #set-cookie basliginin ilk kismi cookie nin adini ve degerini icerir
+            attributes = {}
+            #sozluk olusturuyoruz.dict key-value seklinde verileri saklar
+            for part in parts[1:]:
+                if not part:
+                    continue
+                attr_name, _, attr_value = part.partition("=")
+                attributes[attr_name.strip().lower()] = attr_value.strip()
+            #0.indeximiz cookienin degeri 1.indexten baslayarak sirasiyla digerlerini aliyoruz
+            #cookie ozellikelrini incelemek icin
+            issues: list[tuple[str, str]] = []
+            
+            if is_https and "secure" not in attributes:
+                issues.append(("medium","missing Secure attribute"))
+                
+            if "httponly" not in attributes:
+                issues.append(("low", "missing HttpOnly attribute"))
+            
+            samesite = attributes.get("samesite")
+            if samesite is None :
+                issues.append(("low", "missing SameSite attribute" ))
+            elif samesite.lower() == "none" and "Secure" not in attributes:
+                #samesite = none secure olamdan modern tarayicilarda reddedilir.
+                issues.append(("medium", "SameSite=None without Secure"))
+            #cookie adının başına yazmak tek başına yeterli değildir. Cookie'nin ilgili kurallara da uyması gerekir.
+                _#_Host-  kuralları
+                # Bir cookie __Host- ile başlıyorsa:
+                # 1. Secure özelliği bulunmalıdır.
+                # 2. Path=/ olmalıdır.
+                # 3. Domain özelliği bulunmamalıdır.    
+            if cookie_name.startswith("_Host_") and (
+                "secure" not in attributes or attributes.get("path") != "/"
+                or "domain" in attributes
+            ):
+                issues.append(("medium", "__Host- prefix rules not satisfied"))
+            if not issues:
+                continue
+            top_severity = max((sev for sev, _ in issues), key= SEVERITY_ORDER.get)
+            findings.append(
+                Finding(
+                    title=f"Cookie security attributes:{cookie_name}",
+                    severity=top_severity,
+                    description=(
+                        "The cookie has the following issues: "
+                        + ", ".join(text for _, text in issues)
+                        + "."
+                    ),
+                    #deger gizlenir sadece isim ve oznitelikler gosterilir.
+                    evidence=_truncate(
+                        f"Set-Cookie: {cookie_name} =<redacted>; "
+                        + "; ".join(parts[1:])
+                    ),
+                    recommendation=(
+                        "Set Secure on HTTPS cookies, HttpOnly for cookies not "
+                        "needed by JavaScript, and an explicit SameSite value "
+                        "(Lax/Strict, or None with Secure)."
+                    ),
+                )
+            )    
+            return findings
+#web sitesinin https kulanip kullanmadigini ve guvenlik sorunlari olup olmadiigni konrol ediyorum.
+def   check_transport(response: Response) -> list[Finding]:
+    #iki adet amacimiz var:
+    # Web sitesinin HTTPS kullanıp kullanmadığını kontrol etmek.
+    # Yönlendirme zincirinde HTTPS bağlantısından
+    # HTTP bağlantısına geçiş olup olmadığını belirlemek.
+    findings: list [Finding] = []
+    
+    if _schema(response.url) != "https":
+        findings.append(
+            Finding(
+                title="Response served over HTTP ",
+                severity="medium",
+                description=(
+                    "The final response was delivered without TLS, so "
+                    "transport-level protections (including HSTS) do not apply."    
+                ),
+                evidence=f"Final URL: {_truncate(response.url)}",
+                recommendation="Serve the site over HTTPS and redirect HTTP to HTTPS. ",
+            )
+        )   
+        
+    #HTTPS -> HTTP gecisi (downgrade) yonlendirme zincirinde var mi?
+    chain = [r.url for r in response.history] + [response.url]
+    for current, nxt in zip(chain, chain[1:]):
+        if _schema(current) == "https" and _schema(nxt) == "http":
+            findings.append(
+                Finding(
+                    title="HTTPS to HTTP redirect downgrade",
+                    severity="medium",
+                    description="A redirect moves the user from HTTPS to plain HTTP.",
+                    evidence=_truncate(f"{current} -> {nxt}"),
+                    recommendation="Keep redirects on HTTPS end-to-end."
+                )
+            )
+            return findings
+ 
+ 
+ #ana analiz fonksiyonu
+def analyze_security_headers(
+    response: Response,
+    probe_cors: bool = False,
+    timeout: float = 10,
+    verify: bool = True,
+)-> list[Finding]:
+    findings: list[Finding] = []
+    findings.extend(check_transport(response))
+    findings.extend(check_missing_headers(response))
+    findings.extend(check_hsts_value(response))
+    findings.extend(check_csp_value(response))
+    findings.extend(check_simple_header_values(response))
+    findings.extend(check_disclosure_headers(response))
+    findings.extend(check_deprecated_headers(response))
+    findings.extend(check_cors_configuration(response))
+    findings.extend(check_cookie_security(response))
+    
+    if probe_cors:
+        findings.extend(check_cors_reflection(response.url,timeout=timeout, verify=verify))
+        
+        #en kritik bilgiler en ustte
+         
+    findings.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 0), reverse=True)
+        
+    return findings
+    
+    
+ 
+
+      
+
+                    
+                                
 
     
