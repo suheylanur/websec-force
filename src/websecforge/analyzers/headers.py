@@ -905,7 +905,7 @@ def analyze_security_headers(
     findings.extend(check_transport(response))
     findings.extend(check_missing_headers(response))
     findings.extend(check_hsts_value(response))
-    findings.extend(check_csp_value(response))
+    findings.extend(check_csp_value(response))  
     findings.extend(check_simple_header_values(response))
     findings.extend(check_disclosure_headers(response))
     findings.extend(check_deprecated_headers(response))
